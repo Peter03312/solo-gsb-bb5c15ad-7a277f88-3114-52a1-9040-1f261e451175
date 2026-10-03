@@ -21,8 +21,14 @@ from .repository import (
     BatchRegionsNotFound,
     BatchRevisionConflict,
     BatchUnsafeTrajectories,
+    CommitmentAlreadyFulfilled,
     CommitmentConflict,
+    CommitmentExplicitlyCancelled,
+    CommitmentExpired,
     CommitmentUnsafe,
+    DepartureNotInFuture,
+    DepartureOutOfWindow,
+    DepartureUnsafe,
     ExemptionDuplicateRegions,
     ExemptionRegionsNotFound,
     ExemptionRevisionConflict,
@@ -31,8 +37,11 @@ from .repository import (
     PassUnsafe,
 )
 from .schemas import (
+    CommitmentFulfillRequest,
+    CommitmentFulfillResponse,
     CommitmentIssueRequest,
     CommitmentOut,
+    DepartureIntervalOut,
     ExemptionPreviewRequest,
     ExemptionPreviewResponse,
     ObservationEventPage,
@@ -69,8 +78,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.9.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试；安全员还可对固定行程做最小区域豁免预演（只读）：在可豁免候选区域的子集中找出使候选窗口内存在安全出发时刻的最优方案（豁免数最少、最早安全时刻、编号字典序），预演不改变任何数据；也可对多区调整做批量变更影响预演（只读）：基于同一已提交快照报告各轨迹安全结论与穿越明细、将冲突的通行凭证、将被清空的择时承诺与观察结论净翻转，预演不改变任何数据、不占用区域编号。",
+    version="1.10.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；安全员还可把尚未取消、窗口未结束的承诺兑现为一张固定时刻通行凭证（POST /api/commitments/{id}/fulfill）：在与区域变更、承诺取消及凭证签发共用的写事务内重验出发时刻晚于受理时刻、落在原候选窗口与按当前区域集合重算的安全出发区间内，成功后原承诺按既有取消语义失效、只生成一张凭证，区域 revision 不变，并发兑现至多一次成功且失败方可区分已兑现与普通取消；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试；安全员还可对固定行程做最小区域豁免预演（只读）：在可豁免候选区域的子集中找出使候选窗口内存在安全出发时刻的最优方案（豁免数最少、最早安全时刻、编号字典序），预演不改变任何数据；也可对多区调整做批量变更影响预演（只读）：基于同一已提交快照报告各轨迹安全结论与穿越明细、将冲突的通行凭证、将被清空的择时承诺与观察结论净翻转，预演不改变任何数据、不占用区域编号。",
     lifespan=lifespan,
 )
 
@@ -260,6 +269,7 @@ def _commitment_row_to_out(row: dict, intervals: list[dict]) -> dict:
         "intervals": _commitment_intervals_to_out(intervals),
         "issued_at": row["created_at"],
         "cancelled_at": row["cancelled_at"],
+        "fulfilled_pass_id": row.get("fulfilled_pass_id"),
     }
 
 
@@ -456,6 +466,81 @@ async def _on_commitment_conflict(_request: Request, exc: CommitmentConflict):
           "message": f"承诺 {cid}（未取消且窗口未结束）在变更前仍有未来安全出发时刻，"
                      f"变更后窗口结束前将不再有任何安全出发时刻"}
          for cid in exc.commitment_ids],
+    )
+
+
+@app.exception_handler(CommitmentAlreadyFulfilled)
+async def _on_commitment_already_fulfilled(_request: Request, exc: CommitmentAlreadyFulfilled):
+    return _error_response(
+        409,
+        "commitment_already_fulfilled",
+        str(exc),
+        [{"loc": ["path", "commitment_id"],
+          "message": f"承诺已被兑现为通行凭证 {exc.pass_id}，不能重复兑现",
+          "pass_id": exc.pass_id}],
+    )
+
+
+@app.exception_handler(CommitmentExplicitlyCancelled)
+async def _on_commitment_explicitly_cancelled(_request: Request, exc: CommitmentExplicitlyCancelled):
+    return _error_response(
+        422,
+        "commitment_cancelled",
+        "承诺已取消，不能兑现",
+        [{"loc": ["path", "commitment_id"], "message": "承诺已被普通取消，不能兑现"}],
+    )
+
+
+@app.exception_handler(CommitmentExpired)
+async def _on_commitment_expired(_request: Request, exc: CommitmentExpired):
+    return _error_response(
+        422,
+        "commitment_expired",
+        "承诺候选窗口已结束，不能兑现",
+        [{"loc": ["path", "commitment_id"],
+          "message": "承诺候选窗口终点不晚于服务端受理时刻，窗口已结束"}],
+    )
+
+
+@app.exception_handler(DepartureNotInFuture)
+async def _on_departure_not_in_future(_request: Request, exc: DepartureNotInFuture):
+    return _error_response(
+        422,
+        "departure_not_in_future",
+        str(exc),
+        [{"loc": ["body", "departure_time"],
+          "message": "出发时刻必须晚于服务端受理时刻（当前服务时间）"}],
+    )
+
+
+@app.exception_handler(DepartureOutOfWindow)
+async def _on_departure_out_of_window(_request: Request, exc: DepartureOutOfWindow):
+    return _error_response(
+        422,
+        "departure_out_of_window",
+        str(exc),
+        [{"loc": ["body", "departure_time"],
+          "message": "出发时刻必须落在承诺原候选窗口 [window_start, window_end) 内"}],
+    )
+
+
+@app.exception_handler(DepartureUnsafe)
+async def _on_departure_unsafe(_request: Request, exc: DepartureUnsafe):
+    details = [{"loc": ["body", "departure_time"],
+                "message": "出发时刻不在按当前区域集合重算的安全出发区间内"}]
+    if exc.safe_intervals:
+        # 回显当前（窗口内）左闭右开安全区间，便于客户端改取安全时刻重试；
+        # 经响应模型序列化（UTC Z 时刻的纯 JSON 结构）
+        dumped = [
+            DepartureIntervalOut.model_validate(iv).model_dump(mode="json")
+            for iv in _commitment_intervals_to_out(exc.safe_intervals)
+        ]
+        details.append({"safe_intervals": dumped})
+    return _error_response(
+        422,
+        "unsafe_trajectory",
+        "出发时刻不在当前安全出发区间内，承诺未兑现且不改变承诺",
+        details,
     )
 
 
@@ -1129,6 +1214,79 @@ def cancel_commitment(commitment_id: int = Path(ge=1)):
     return _commitment_row_to_out(row, [])
 
 
+@app.post("/api/commitments/{commitment_id}/fulfill",
+          response_model=CommitmentFulfillResponse, status_code=201,
+          responses={
+              404: {"description": "未知承诺（not_found）"},
+              409: {"description": "承诺已被兑现（commitment_already_fulfilled）"},
+              422: {"description": "已取消 / 窗口已结束 / 出发时刻不晚于受理时刻 /"
+                                   " 越出候选窗口 / 不在当前安全出发区间"},
+          },
+          tags=["commitments"])
+def fulfill_commitment(
+    payload: CommitmentFulfillRequest,
+    commitment_id: int = Path(ge=1),
+):
+    """把一张**尚未取消、窗口未结束**的择时通行承诺兑现为一张**固定时刻
+    通行凭证**。
+
+    输入承诺编号（路径）与**带时区的出发时刻** `departure_time`（服务端
+    归一化为 UTC）。在与区域变更、承诺取消及凭证签发共用的全局元数据行
+    锁写事务内完成，全部检查在落库前的同一事务重验：
+
+    * 出发时刻必须**晚于服务端受理时刻**（以拿到写锁后的当前时间为准）；
+    * 必须落在承诺**原候选窗口** `[window_start, window_end)` 内；
+    * 必须落在**按当前区域集合重算**的安全出发区间内（与
+      `/api/schedule` 同一精确区间运算，左闭右开）；
+    * 服务端按承诺的相对秒数轨迹生成绝对时刻轨迹
+      （点 i 时刻 = departure_time + t_i），据此只签发一张通行凭证。
+
+    成功返回 **201**：`commitment_id`、`pass`（结构与
+    `GET /api/passes/{id}` 一致，`status=active`）与所据区域 `revision`。
+    原承诺按**既有取消语义**失效（`status=cancelled`，`GET` 可经
+    `fulfilled_pass_id` 找到凭证）；只生成一张凭证；**区域 revision 不
+    因兑现改变**（不写区域变更审计）。新凭证即刻受既有 `pass_conflict`
+    保护规则约束。
+
+    失败均不给凭证且**不改变承诺**（除已取消/已兑现/已过期这些既成
+    状态外）：未知承诺 **404** `not_found`；已兑现 **409**
+    `commitment_already_fulfilled`（details 带已生成的 `pass_id`，
+    与普通取消区分）；普通取消 **422** `commitment_cancelled`；窗口
+    已结束 **422** `commitment_expired`；出发时刻不晚于受理时刻
+    **422** `departure_not_in_future`；越出候选窗口 **422**
+    `departure_out_of_window`；不在当前安全出发区间 **422**
+    `unsafe_trajectory`（details 回显当前安全区间）。
+
+    并发兑现/取消在同一把行锁上串行化：同一承诺至多一次兑现成功；
+    后到的兑现请求按其终态得到 409 已兑现或 422 已取消，两种失败原因
+    可区分。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                result = repository.fulfill_commitment(
+                    cur, commitment_id, payload.departure_time
+                )
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                if result is None:
+                    conn.rollback()
+                else:
+                    conn.commit()
+    if result is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"承诺 {commitment_id} 不存在"}})
+    return {
+        "commitment_id": commitment_id,
+        "revision": result["revision"],
+        "pass": _pass_row_to_out(result["pass"]),
+    }
+
+
 # ---------------------------------------------------------------- 安全状态观察
 
 OBSERVATION_EVENT_PAGE_MAX = 500
@@ -1499,6 +1657,7 @@ def root():
             "POST /api/passes/{id}/cancel",
             "POST /api/commitments", "GET /api/commitments/{id}",
             "POST /api/commitments/{id}/cancel",
+            "POST /api/commitments/{id}/fulfill",
             "POST /api/observations", "GET /api/observations/{id}",
             "POST /api/observations/{id}/cancel",
             "GET /api/observations/{id}/events",

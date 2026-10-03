@@ -99,6 +99,40 @@ class CommitmentConflict(Exception):
         self.commitment_ids = commitment_ids
 
 
+# ---------------------------------------------------------------- 承诺兑现
+
+class CommitmentAlreadyFulfilled(Exception):
+    """承诺已被兑现（与普通取消相区分）；携带已生成的通行凭证 id。"""
+
+    def __init__(self, pass_id: int):
+        super().__init__(f"承诺已被兑现为通行凭证 {pass_id}")
+        self.pass_id = pass_id
+
+
+class CommitmentExplicitlyCancelled(Exception):
+    """承诺已被普通取消（非兑现），不能兑现。"""
+
+
+class CommitmentExpired(Exception):
+    """候选窗口已结束（window_end 不晚于受理时刻），承诺过期不能兑现。"""
+
+
+class DepartureNotInFuture(Exception):
+    """出发时刻不晚于服务端受理时刻（拿到写锁后的当前时间）。"""
+
+
+class DepartureOutOfWindow(Exception):
+    """出发时刻落在承诺原候选窗口 [window_start, window_end) 之外。"""
+
+
+class DepartureUnsafe(Exception):
+    """出发时刻不在按当前区域集合重算的安全出发区间内；携带当前安全区间。"""
+
+    def __init__(self, safe_intervals: list[dict]):
+        super().__init__("出发时刻不在当前安全出发区间内")
+        self.safe_intervals = safe_intervals
+
+
 class IdempotencyKeyConflict(Exception):
     """同一幂等键被内容不同的请求复用（操作类型/目标区域/请求内容不一致）。"""
 
@@ -1183,7 +1217,8 @@ def issue_commitment(
         VALUES (%(trajectory)s::jsonb, %(window_start)s, %(window_end)s,
                 'active', %(revision)s)
         RETURNING id, trajectory, window_start, window_end, status,
-                  issued_revision, created_at, cancelled_at
+                  issued_revision, created_at, cancelled_at,
+                  fulfilled_at, fulfilled_pass_id
         """,
         {
             "trajectory": json.dumps(
@@ -1203,7 +1238,8 @@ def get_commitment(cur, commitment_id: int) -> dict | None:
     cur.execute(
         """
         SELECT id, trajectory, window_start, window_end, status,
-               issued_revision, created_at, cancelled_at
+               issued_revision, created_at, cancelled_at,
+               fulfilled_at, fulfilled_pass_id
         FROM commitments WHERE id = %s
         """,
         (commitment_id,),
@@ -1214,13 +1250,16 @@ def get_commitment(cur, commitment_id: int) -> dict | None:
 def cancel_commitment(cur, commitment_id: int) -> dict | None:
     """取消承诺；重复取消幂等（已取消的直接返回现状）。未找到返回 None。
 
-    与签发、所有区域写入在同一把 meta 行锁上串行化。
+    与签发、所有区域写入在同一把 meta 行锁上串行化。已被兑现的承诺按
+    既有取消语义已是 cancelled（fulfilled_pass_id 非空），重复取消同样
+    幂等返回现状，不会改动兑现标记。
     """
     get_revision(cur)
     cur.execute(
         """
         SELECT id, trajectory, window_start, window_end, status,
-               issued_revision, created_at, cancelled_at
+               issued_revision, created_at, cancelled_at,
+               fulfilled_at, fulfilled_pass_id
         FROM commitments WHERE id = %s
         FOR UPDATE
         """,
@@ -1235,12 +1274,140 @@ def cancel_commitment(cur, commitment_id: int) -> dict | None:
             UPDATE commitments SET status = 'cancelled', cancelled_at = now()
             WHERE id = %s
             RETURNING id, trajectory, window_start, window_end, status,
-                      issued_revision, created_at, cancelled_at
+                      issued_revision, created_at, cancelled_at,
+                      fulfilled_at, fulfilled_pass_id
             """,
             (commitment_id,),
         )
         row = cur.fetchone()
     return row
+
+
+def _departure_is_safe(safe_intervals: list[dict], departure: float) -> bool:
+    """出发时刻是否落在某段左闭右开安全出发区间内（严格端点判定）。
+
+    安全区间由与 /api/schedule 完全相同的精确区间运算生成，左闭右开：
+    区间起点可出发、终点不可出发，因此这里直接做 start <= s < end，
+    不引入任何容差，保证与调度语义逐点一致。
+    """
+    return any(
+        iv["start"] <= departure < iv["end"]
+        for iv in safe_intervals
+    )
+
+
+def fulfill_commitment(cur, commitment_id: int, departure: datetime) -> dict:
+    """把一张择时通行承诺兑现为一张固定时刻通行凭证（同一写事务）。
+
+    在持有全局元数据行锁的事务内完成，与区域变更、承诺取消及凭证签发
+    共用该锁串行化：
+
+    * 未知承诺：返回 None（调用方回滚并返回 404）；
+    * 已兑现（cancelled 且 fulfilled_pass_id 非空）：抛
+      CommitmentAlreadyFulfilled，失败方可与普通取消区分；
+    * 已普通取消：抛 CommitmentExplicitlyCancelled；
+    * 窗口已结束（window_end 不晚于受理时刻）：抛 CommitmentExpired；
+    * 出发时刻不晚于受理时刻：抛 DepartureNotInFuture；
+    * 出发时刻不在原候选窗口 [window_start, window_end)：抛
+      DepartureOutOfWindow；
+    * 出发时刻不在按当前区域集合重算的安全出发区间内：抛
+      DepartureUnsafe（携带当前安全区间）。
+
+    成功时：按承诺相对轨迹生成绝对时刻轨迹（出发时刻 + 相对秒数），
+    只插入一张凭证，承诺按既有取消语义置为 cancelled（cancelled_at、
+    fulfilled_at 置位并记录凭证 id）；不推进区域 revision，新凭证的
+    issued_revision 为本次重验所据的当前 revision。返回
+    {"revision", "commitment", "pass"}。
+    """
+    # 锁全局元数据行：与区域变更、承诺/凭证的签发与取消串行化，
+    # 重验与落库之间无人插队
+    revision = get_revision(cur)
+    now = utcnow()
+    cur.execute(
+        """
+        SELECT id, trajectory, window_start, window_end, status,
+               issued_revision, created_at, cancelled_at,
+               fulfilled_at, fulfilled_pass_id
+        FROM commitments WHERE id = %s
+        FOR UPDATE
+        """,
+        (commitment_id,),
+    )
+    commitment = cur.fetchone()
+    if commitment is None:
+        return None
+
+    if commitment["status"] == "cancelled":
+        # 承诺已失效：先区分「已兑现」与「普通取消」，失败方据此分支处理
+        if commitment["fulfilled_pass_id"] is not None:
+            raise CommitmentAlreadyFulfilled(int(commitment["fulfilled_pass_id"]))
+        raise CommitmentExplicitlyCancelled()
+
+    # 窗口未结束：以服务端受理时刻（拿到写锁后的 now）为准
+    if commitment["window_end"] <= now:
+        raise CommitmentExpired()
+
+    departure_epoch = departure.timestamp()
+    if departure_epoch <= now.timestamp():
+        raise DepartureNotInFuture()
+
+    window_start_epoch = _epoch(commitment["window_start"])
+    window_end_epoch = _epoch(commitment["window_end"])
+    if not (window_start_epoch <= departure_epoch < window_end_epoch):
+        raise DepartureOutOfWindow()
+
+    # 在写事务内按当前完整区域集合重算安全出发区间（与 /api/schedule
+    # 同一精确区间运算），并确认出发时刻落在其中
+    regions = [
+        _region_row_to_geom(r) for r in _load_all_regions_locked(cur).values()
+    ]
+    rel_traj = [
+        (float(p["t"]), float(p["x"]), float(p["y"]))
+        for p in commitment["trajectory"]
+    ]
+    safe_intervals = geometry.safe_departure_intervals(
+        rel_traj, regions, window_start_epoch, window_end_epoch
+    )
+    if not _departure_is_safe(safe_intervals, departure_epoch):
+        raise DepartureUnsafe(safe_intervals)
+
+    # 按承诺的相对轨迹生成绝对时刻轨迹：点 i 的绝对时刻 = 出发时刻 + t_i
+    abs_traj = [
+        (departure_epoch + t, x, y) for t, x, y in rel_traj
+    ]
+    cur.execute(
+        """
+        INSERT INTO passes (trajectory, start_time, end_time, status, issued_revision)
+        VALUES (%(trajectory)s::jsonb, %(start)s, %(end)s, 'active', %(revision)s)
+        RETURNING id, trajectory, status, issued_revision, created_at, cancelled_at
+        """,
+        {
+            "trajectory": json.dumps(
+                [{"x": x, "y": y, "t": t} for t, x, y in abs_traj]
+            ),
+            "start": datetime.fromtimestamp(abs_traj[0][0], tz=timezone.utc),
+            "end": datetime.fromtimestamp(abs_traj[-1][0], tz=timezone.utc),
+            "revision": revision,
+        },
+    )
+    pass_row = cur.fetchone()
+
+    # 原承诺按既有取消语义失效（status/cancelled_at），并标记兑现来源；
+    # 不推进区域 revision、不写区域变更审计
+    cur.execute(
+        """
+        UPDATE commitments
+        SET status = 'cancelled', cancelled_at = now(),
+            fulfilled_at = now(), fulfilled_pass_id = %(pass_id)s
+        WHERE id = %(id)s
+        RETURNING id, trajectory, window_start, window_end, status,
+                  issued_revision, created_at, cancelled_at,
+                  fulfilled_at, fulfilled_pass_id
+        """,
+        {"pass_id": pass_row["id"], "id": commitment_id},
+    )
+    commitment = cur.fetchone()
+    return {"revision": revision, "commitment": commitment, "pass": pass_row}
 
 
 # ---------------------------------------------------------------- 安全状态观察

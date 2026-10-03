@@ -289,6 +289,27 @@ class CommitmentIssueRequest(BaseModel):
         return _require_utc(v, info.field_name)
 
 
+class CommitmentFulfillRequest(BaseModel):
+    """择时通行承诺兑现请求：一个带时区的出发时刻。
+
+    出发时刻必须晚于服务端受理时刻（以服务端拿到写锁后的当前时间为准）、
+    落在承诺原候选窗口（左闭右开）内、且落在按当前区域集合重算的安全
+    出发区间内；服务端据承诺的相对轨迹生成绝对时刻轨迹并签发一张固定
+    时刻通行凭证。
+    """
+
+    departure_time: datetime = Field(
+        description="带时区的出发时刻（须晚于受理时刻、落在候选窗口与当前安全出发区间内）"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("departure_time")
+    @classmethod
+    def _check_time(cls, v: datetime) -> datetime:
+        return _require_utc(v, "departure_time")
+
+
 class ExemptionPreviewRequest(BaseModel):
     """最小区域豁免预演请求：相对秒数固定行程 + 带时区候选出发窗口 +
     可豁免的互异现有区域编号 + 客户端已读的区域 revision。
@@ -409,10 +430,12 @@ class ExemptionPreviewResponse(_UTCDatetimeModel):
 class CommitmentOut(_UTCDatetimeModel):
     """择时通行承诺：签发/查询/取消的统一响应。
 
-    status: active（未取消）/ cancelled（已取消）；
-    revision 为签发时核验所用的区域集合版本号。
+    status: active（未取消）/ cancelled（已取消，含已被兑现而按取消语义
+    失效的承诺）；revision 为签发时核验所用的区域集合版本号。
     intervals 为「当前时刻」视角的安全出发区间（相对 now 裁剪后的
-    左闭右开区间）；取消承诺时 intervals 恒为空（承诺已失效）。
+    左闭右开区间）；取消/兑现承诺时 intervals 恒为空（承诺已失效）。
+    fulfilled_pass_id 非空表示该承诺已被兑现为指定编号的固定时刻通行
+    凭证（普通取消时为 null，active 承诺恒为 null）。
     """
 
     id: int
@@ -424,6 +447,7 @@ class CommitmentOut(_UTCDatetimeModel):
     intervals: list[DepartureIntervalOut]
     issued_at: datetime
     cancelled_at: datetime | None
+    fulfilled_pass_id: int | None = None
 
 
 class RegionCreatedResponse(_UTCDatetimeModel):
@@ -543,6 +567,20 @@ class PassOut(_UTCDatetimeModel):
     trajectory: list[PassPointOut]
     issued_at: datetime
     cancelled_at: datetime | None
+
+
+class CommitmentFulfillResponse(_UTCDatetimeModel):
+    """承诺兑现成功响应：承诺编号、唯一生成的固定时刻通行凭证与所据区域
+    revision（兑现不推进区域 revision）。
+
+    pass 字段的结构与 GET /api/passes/{id} 完全一致（status 恒为 active）。
+    """
+
+    commitment_id: int
+    revision: int
+    pass_: PassOut = Field(alias="pass")
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class ObservationOut(_UTCDatetimeModel):

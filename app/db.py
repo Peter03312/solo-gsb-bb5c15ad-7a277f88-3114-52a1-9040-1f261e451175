@@ -84,12 +84,23 @@ CREATE TABLE IF NOT EXISTS commitments (
     issued_revision BIGINT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     cancelled_at    TIMESTAMPTZ,
+    -- 兑现（POST /api/commitments/{id}/fulfill）成功后置位：承诺按既有取消
+    -- 语义失效（status='cancelled'、cancelled_at 置位），同时只生成一张
+    -- 固定时刻通行凭证；普通取消的承诺两列恒为 NULL。
+    -- pass id 不在数据库层加外键：凭证由兑现事务同写同生、承诺不可单独
+    -- 删除，应用层保证引用有效（同时保持 passes/commitments 可独立清空）
+    fulfilled_at      TIMESTAMPTZ,
+    fulfilled_pass_id BIGINT,
     CONSTRAINT commitments_status_check CHECK (status IN ('active', 'cancelled')),
     CONSTRAINT commitments_window_order CHECK (window_start < window_end)
 );
 
 CREATE INDEX IF NOT EXISTS idx_commitments_constraining
     ON commitments (status, window_end);
+
+-- 既有库升级：为承诺兑现补充两个可空列（与建表语句一致，不改变任何现有行）
+ALTER TABLE commitments ADD COLUMN IF NOT EXISTS fulfilled_at TIMESTAMPTZ;
+ALTER TABLE commitments ADD COLUMN IF NOT EXISTS fulfilled_pass_id BIGINT;
 
 -- 安全状态观察：安全员为一条带时区绝对时刻轨迹登记的可取消观察；
 -- 安全或不安全均可登记。登记时记录当前安全结论（safe/unsafe）与当时的
@@ -179,6 +190,19 @@ def _init_schema(cur: Cursor) -> None:
         stmt = statement.strip()
         if stmt:
             cur.execute(stmt)
+    # 早期版本曾以数据库外键 commitments_fulfilled_pass_id_fkey 引用
+    # passes(id)：改由应用层保证引用有效（凭证与承诺同事务写入、承诺不可
+    # 单独删除，且 passes/commitments 需能被运维脚本独立 TRUNCATE）
+    cur.execute(
+        """
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'commitments_fulfilled_pass_id_fkey'
+        """
+    )
+    if cur.fetchone() is not None:
+        cur.execute(
+            "ALTER TABLE commitments DROP CONSTRAINT commitments_fulfilled_pass_id_fkey"
+        )
 
 
 def init_pool() -> ConnectionPool:
