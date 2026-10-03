@@ -21,7 +21,12 @@ from .repository import (
     BatchRegionsNotFound,
     BatchRevisionConflict,
     BatchUnsafeTrajectories,
+    CommitmentAlreadyRedeemed,
+    CommitmentCancelled,
     CommitmentConflict,
+    CommitmentExpired,
+    CommitmentRedeemInvalid,
+    CommitmentRedeemUnsafe,
     CommitmentUnsafe,
     ExemptionDuplicateRegions,
     ExemptionRegionsNotFound,
@@ -33,6 +38,8 @@ from .repository import (
 from .schemas import (
     CommitmentIssueRequest,
     CommitmentOut,
+    CommitmentRedeemRequest,
+    CommitmentRedeemResponse,
     ExemptionPreviewRequest,
     ExemptionPreviewResponse,
     ObservationEventPage,
@@ -69,8 +76,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.9.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试；安全员还可对固定行程做最小区域豁免预演（只读）：在可豁免候选区域的子集中找出使候选窗口内存在安全出发时刻的最优方案（豁免数最少、最早安全时刻、编号字典序），预演不改变任何数据；也可对多区调整做批量变更影响预演（只读）：基于同一已提交快照报告各轨迹安全结论与穿越明细、将冲突的通行凭证、将被清空的择时承诺与观察结论净翻转，预演不改变任何数据、不占用区域编号。",
+    version="1.10.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更，并可在窗口内选定一个安全出发时刻把未取消且窗口未结束的承诺在共用写事务内重验后兑现为唯一一张固定时刻通行凭证（原承诺按取消语义失效，可区分已兑现与普通取消，区域 revision 不变）；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试；安全员还可对固定行程做最小区域豁免预演（只读）：在可豁免候选区域的子集中找出使候选窗口内存在安全出发时刻的最优方案（豁免数最少、最早安全时刻、编号字典序），预演不改变任何数据；也可对多区调整做批量变更影响预演（只读）：基于同一已提交快照报告各轨迹安全结论与穿越明细、将冲突的通行凭证、将被清空的择时承诺与观察结论净翻转，预演不改变任何数据、不占用区域编号。",
     lifespan=lifespan,
 )
 
@@ -456,6 +463,63 @@ async def _on_commitment_conflict(_request: Request, exc: CommitmentConflict):
           "message": f"承诺 {cid}（未取消且窗口未结束）在变更前仍有未来安全出发时刻，"
                      f"变更后窗口结束前将不再有任何安全出发时刻"}
          for cid in exc.commitment_ids],
+    )
+
+
+@app.exception_handler(CommitmentAlreadyRedeemed)
+async def _on_commitment_already_redeemed(_request: Request, exc: CommitmentAlreadyRedeemed):
+    return _error_response(
+        409,
+        "commitment_already_redeemed",
+        str(exc),
+        [{"commitment_id": exc.commitment_id, "pass_id": exc.pass_id,
+          "message": f"承诺 {exc.commitment_id} 已兑现为凭证 {exc.pass_id}，"
+                     "一张承诺至多兑现一次，不生成新凭证且承诺状态不变"}],
+    )
+
+
+@app.exception_handler(CommitmentCancelled)
+async def _on_commitment_cancelled(_request: Request, exc: CommitmentCancelled):
+    return _error_response(
+        409,
+        "commitment_cancelled",
+        str(exc),
+        [{"commitment_id": exc.commitment_id,
+          "message": f"承诺 {exc.commitment_id} 已被取消（未兑现），不能再兑现，"
+                     "不生成凭证且承诺状态不变"}],
+    )
+
+
+@app.exception_handler(CommitmentExpired)
+async def _on_commitment_expired(_request: Request, exc: CommitmentExpired):
+    return _error_response(
+        409,
+        "commitment_expired",
+        str(exc),
+        [{"commitment_id": exc.commitment_id,
+          "message": f"承诺 {exc.commitment_id} 的候选出发窗口已结束，"
+                     "不能再兑现，不生成凭证且承诺状态不变"}],
+    )
+
+
+@app.exception_handler(CommitmentRedeemInvalid)
+async def _on_commitment_redeem_invalid(_request: Request, exc: CommitmentRedeemInvalid):
+    return _error_response(422, "invalid_input", str(exc), [])
+
+
+@app.exception_handler(CommitmentRedeemUnsafe)
+async def _on_commitment_redeem_unsafe(_request: Request, exc: CommitmentRedeemUnsafe):
+    # 只回显有穿越的区域；经响应模型序列化（UTC Z 时刻）
+    violated = [r for r in exc.results if r["crossings"]]
+    details = [
+        RegionResultOut.model_validate(r).model_dump(mode="json")
+        for r in _crossings_to_out(violated)
+    ]
+    return _error_response(
+        422,
+        "unsafe_trajectory",
+        "该出发时刻不在按当前区域集合重算的安全出发区间内，凭证未生成且承诺保持有效",
+        details,
     )
 
 
@@ -1129,6 +1193,76 @@ def cancel_commitment(commitment_id: int = Path(ge=1)):
     return _commitment_row_to_out(row, [])
 
 
+@app.post("/api/commitments/{commitment_id}/redeem",
+          response_model=CommitmentRedeemResponse, status_code=201,
+          responses={
+              404: {"description": "未知承诺（not_found）"},
+              409: {"description": "承诺已兑现（commitment_already_redeemed，带 pass_id）/"
+                                  "已普通取消（commitment_cancelled）/窗口已结束（commitment_expired）"},
+              422: {"description": "出发时刻不晚于受理时刻或越出原候选窗口（invalid_input），"
+                                   "或不在当前安全出发区间内（unsafe_trajectory）"},
+          },
+          tags=["commitments"])
+def redeem_commitment(payload: CommitmentRedeemRequest,
+                      commitment_id: int = Path(ge=1)):
+    """把一张**未取消、窗口未结束**的择时通行承诺兑现为**一张固定时刻
+    通行凭证**。
+
+    请求体只含带时区的绝对 `departure_time`（服务端归一化为 UTC）。整个
+    兑现与区域变更、承诺取消、凭证签发**共用同一把全局元数据行锁**，在
+    **同一个写事务**内完成：
+
+    1. 锁定承诺行并按下列次序校验，任一失败**不生成凭证、不改变承诺**：
+       * 未知承诺：**404** `not_found`；
+       * 已被兑现：**409** `commitment_already_redeemed`，details 带已生成的
+         `pass_id`——可与普通取消区分；
+       * 已被普通取消：**409** `commitment_cancelled`；
+       * 候选窗口已结束（`window_end` 不晚于服务端受理时刻）：
+         **409** `commitment_expired`；
+       * 出发时刻不晚于受理时刻，或不在原候选窗口 `[window_start,
+         window_end)` 内：**422** `invalid_input`；
+       * 按**当前区域集合**重算安全出发区间后，出发时刻不在其中（按承诺的
+         相对轨迹展开为绝对时刻轨迹后发生穿越）：**422**
+         `unsafe_trajectory`（details 列穿越明细）。
+    2. 全部通过：按承诺的相对秒数轨迹以 `departure_time` 为首点展开成
+       绝对时刻轨迹，**只生成一张**通行凭证；原承诺在同一事务按**既有取消
+       语义**失效（`status=cancelled`、`cancelled_at` 回填，并记录
+       `redeemed_pass_id` 以便与普通取消区分）。
+    3. 响应含 `commitment_id`、`pass`（新凭证，结构同 `POST /api/passes`
+       的响应，`revision` 为重验所用的当前区域集合版本）与 `revision`。
+       **兑现不推进区域 revision**，也不产生区域变更审计记录。
+
+    并发安全：兑现与区域变更/取消/凭证签发在同一行锁上串行化，**同一张
+    承诺并发兑现至多一次成功**；原承诺与凭证的查询、取消响应及区域保护
+    规则保持兼容（兑现后的承诺即一张已取消承诺，新凭证立即承担凭证的
+    既有 `pass_conflict` 保护）。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                result = repository.redeem_commitment(
+                    cur, commitment_id, payload.departure_time
+                )
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                if result is None:
+                    conn.rollback()
+                else:
+                    conn.commit()
+    if result is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"承诺 {commitment_id} 不存在"}})
+    return {
+        "commitment_id": commitment_id,
+        "pass": _pass_row_to_out(result["pass"]),
+        "revision": result["revision"],
+    }
+
+
 # ---------------------------------------------------------------- 安全状态观察
 
 OBSERVATION_EVENT_PAGE_MAX = 500
@@ -1499,6 +1633,7 @@ def root():
             "POST /api/passes/{id}/cancel",
             "POST /api/commitments", "GET /api/commitments/{id}",
             "POST /api/commitments/{id}/cancel",
+            "POST /api/commitments/{id}/redeem",
             "POST /api/observations", "GET /api/observations/{id}",
             "POST /api/observations/{id}/cancel",
             "GET /api/observations/{id}/events",

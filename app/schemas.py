@@ -289,6 +289,24 @@ class CommitmentIssueRequest(BaseModel):
         return _require_utc(v, info.field_name)
 
 
+class CommitmentRedeemRequest(BaseModel):
+    """择时通行承诺兑现请求：安全员选定的带时区绝对出发时刻。
+
+    服务端归一化为 UTC；该时刻必须晚于服务端受理时刻（拿到写锁后的当前
+    时间）、落在承诺原候选窗口（左闭右开）及按当前区域集合重算的安全
+    出发区间内。
+    """
+
+    departure_time: datetime = Field(description="带时区的绝对出发时刻（须晚于受理时刻且在原候选窗口与当前安全出发区间内）")
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("departure_time")
+    @classmethod
+    def _check_time(cls, v: datetime) -> datetime:
+        return _require_utc(v, "departure_time")
+
+
 class ExemptionPreviewRequest(BaseModel):
     """最小区域豁免预演请求：相对秒数固定行程 + 带时区候选出发窗口 +
     可豁免的互异现有区域编号 + 客户端已读的区域 revision。
@@ -543,6 +561,22 @@ class PassOut(_UTCDatetimeModel):
     trajectory: list[PassPointOut]
     issued_at: datetime
     cancelled_at: datetime | None
+
+
+class CommitmentRedeemResponse(_UTCDatetimeModel):
+    """承诺兑现成功响应：原承诺按既有取消语义失效，只生成一张固定时刻凭证。
+
+    commitment_id 为被兑现的承诺编号（兑现后 GET/取消均为 cancelled 语义）；
+    pass 为唯一新生成的通行凭证（轨迹由承诺相对轨迹按 departure_time 展开
+    为绝对时刻）；revision 为本次兑现重验安全性所依据的当前区域集合版本，
+    兑现不推进该 revision。
+    """
+
+    commitment_id: int
+    pass_: PassOut = Field(alias="pass")
+    revision: int
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class ObservationOut(_UTCDatetimeModel):

@@ -238,6 +238,88 @@ curl -X POST http://localhost:8000/api/regions/batch/preview \
   全局元数据行锁，完全串行化——不存在"区间算好到落库之间被并发变更
   插队"的漏检窗口。
 
+## 承诺兑现规则（redeem：承诺 → 固定时刻通行凭证）
+
+安全员可以把一张**尚未取消、候选窗口未结束**的择时通行承诺，按自己选定
+的出发时刻**兑现为一张固定时刻通行凭证**：系统在与区域变更、承诺取消、
+凭证签发**共用的写事务**内按**当前区域集合**重新核验，通过后才生成
+**唯一一张**凭证，同时让原承诺按既有取消语义失效。
+
+* **兑现 `POST /api/commitments/{id}/redeem`**：请求体只含一个带时区的
+  绝对出发时刻：
+
+  ```json
+  {"departure_time": "2030-06-01T07:58:30Z"}
+  ```
+
+  时刻服务端归一化为 UTC，且必须同时满足：
+  * **严格晚于服务端受理时刻**（以服务端拿到写锁后的当前时间为准）；
+  * 落在承诺的**原候选窗口** `[window_start, window_end)`（左闭右开）内；
+  * 落在按**当前区域集合**重算的**安全出发区间**内（不是仅签发时安全
+    即可——签发后新增/修订的区域同样参与本次重验）。
+  兑现事务按固定顺序执行：锁定全局元数据行 → `FOR UPDATE` 锁定承诺行 →
+  取受理时刻与当前区域集合 → 重算安全出发区间 → 展开绝对时刻轨迹并重验
+  → 插入凭证 → 置承诺失效。
+* **成功响应（201）**：
+
+  ```json
+  {
+    "commitment_id": 2,
+    "pass": {
+      "id": 11,
+      "status": "active",
+      "revision": 1,
+      "trajectory": [
+        {"x": -50.0, "y": 50.0, "t": "2030-06-01T07:58:30Z"},
+        {"x": 150.0, "y": 50.0, "t": "2030-06-01T07:59:30Z"}
+      ],
+      "issued_at": "2030-06-01T04:00:00.000000Z",
+      "cancelled_at": null
+    },
+    "revision": 1
+  }
+  ```
+
+  * `pass.trajectory` 是按承诺的相对秒数轨迹以 `departure_time` 为首点
+    展开的**绝对时刻轨迹**（第 *i* 点时刻 = `departure_time + t_i`），
+    结构与 `POST /api/passes` 的凭证完全一致；
+  * `revision`（与 `pass.revision`）为本次重验所依据的**当前区域集合
+    版本**；**兑现不推进区域 revision**，也不产生区域变更审计记录；
+  * 一笔兑现**只生成一张凭证**。
+* **原承诺的既有语义保持兼容**：兑现即把承诺按**既有取消语义**置为
+  `cancelled`（回填 `cancelled_at`），因此
+  `GET /api/commitments/{id}` 仍返回 `status=cancelled`、`intervals` 恒为
+  `[]`；`POST /api/commitments/{id}/cancel` 仍幂等返回 200；已兑现承诺
+  不再以承诺身份约束区域变更。新凭证立即承担通行凭证的既有保护
+  （未取消且末点未过时，使它不安全的区域变更返回 **409**
+  `pass_conflict`）。承诺行额外记录 `redeemed_pass_id`（仅内部使用，
+  查询/取消响应中不出现），用于区分两种失效原因。
+* **失败：不出凭证、不改变承诺**，错误可区分：
+
+  | 状态码 | error.code | 触发条件 |
+  | --- | --- | --- |
+  | 404 | `not_found` | 未知承诺编号 |
+  | 409 | `commitment_already_redeemed` | 承诺**已兑现**过；details 带已生成的 `pass_id`，可据此取回原凭证 |
+  | 409 | `commitment_cancelled` | 承诺被**普通取消**（未兑现） |
+  | 409 | `commitment_expired` | 候选窗口已结束（`window_end` 不晚于受理时刻） |
+  | 422 | `invalid_input` | 出发时刻不晚于受理时刻，或越出原候选窗口 `[window_start, window_end)` |
+  | 422 | `unsafe_trajectory` | 出发时刻不在按当前集合重算的安全出发区间内；details 列出展开后轨迹的穿越明细 |
+  | 422 | `validation_error` | 请求体结构问题（不带时区、多余字段等） |
+
+  所有失败都在提交前回滚，凭证不插入、承诺保持 `active`（已取消/已兑现/
+  已过期的承诺状态同样不变）。
+* **并发**：兑现与区域变更、承诺签发/取消、凭证签发在同一把全局元数据
+  行锁上串行化。**同一张承诺的并发兑现至多一次成功**；其余请求在赢家
+  提交后拿到 **409** `commitment_already_redeemed`（带同一张凭证 id），
+  而不是普通取消错误。
+
+```bash
+# 把承诺 2 在选定的安全出发时刻兑现为一张固定时刻凭证
+curl -X POST http://localhost:8000/api/commitments/2/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"departure_time":"2030-06-01T07:58:30Z"}'
+```
+
 ## 安全状态观察规则（登记 / 查询 / 取消 / 事件）
 
 安全员可以为一条**带时区绝对时刻轨迹**登记**可取消的安全状态观察**：
@@ -625,6 +707,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/commitments` | 为相对秒数固定行程+候选窗口签发择时通行承诺（201） |
 | GET | `/api/commitments/{id}` | 按 ID 查询承诺与当前可用安全出发区间 |
 | POST | `/api/commitments/{id}/cancel` | 取消承诺（幂等），返回状态 |
+| POST | `/api/commitments/{id}/redeem` | 把未取消且窗口未结束的承诺按选定出发时刻兑现为唯一一张固定时刻凭证（201）；区域 revision 不变 |
 | POST | `/api/observations` | 为带时区绝对时刻轨迹登记安全状态观察（201；安全/不安全均可） |
 | GET | `/api/observations/{id}` | 按 ID 查询观察（轨迹/状态/最近结论/revision） |
 | POST | `/api/observations/{id}/cancel` | 取消观察（幂等），返回状态 |
@@ -954,6 +1037,36 @@ curl -X POST http://localhost:8000/api/commitments/1/cancel  # 取消，幂等
 }
 ```
 
+### 承诺兑现 `POST /api/commitments/{id}/redeem`
+
+安全员选定一个出发时刻，把未取消、窗口未结束的承诺兑现为**一张**固定
+时刻通行凭证。请求体只含带时区的绝对时刻：
+
+```json
+{"departure_time": "2030-06-01T07:58:30Z"}
+```
+
+该时刻必须**晚于服务端受理时刻**、落在原候选窗口 `[window_start,
+window_end)` 内，并在**按当前区域集合重算**的安全出发区间内。成功
+**201** 返回 `commitment_id`、`pass`（新凭证，轨迹由承诺相对轨迹按
+出发时刻展开为绝对时刻，`revision` 为重验所用区域版本）与 `revision`；
+**兑现不推进区域 revision**。原承诺同事务按取消语义失效，查询/取消
+响应不变（仍为 `cancelled`、`intervals` 为空），新凭证立即承担
+`pass_conflict` 保护。
+
+```bash
+curl -X POST http://localhost:8000/api/commitments/2/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"departure_time":"2030-06-01T07:58:30Z"}'
+```
+
+失败均不生成凭证、不改变承诺，并可区分原因：未知承诺 **404**
+`not_found`；**409** `commitment_already_redeemed`（已兑现，details 带
+`pass_id`）/ `commitment_cancelled`（普通取消）/ `commitment_expired`
+（窗口已结束）；出发时刻不晚于受理时刻或越窗 **422** `invalid_input`；
+不在当前安全出发区间内 **422** `unsafe_trajectory`（带穿越明细）。同一
+承诺并发兑现至多一次成功，失败方均拿到 `commitment_already_redeemed`。
+
 ### 安全状态观察 `POST /api/observations`
 
 为带时区绝对时刻轨迹登记可取消的安全状态观察。请求体与 `/api/verify`
@@ -1100,6 +1213,10 @@ revision 冲突、区域变更与未取消凭证冲突、幂等键冲突）。�
 `not_found`（404，未知凭证 ID）；
 择时承诺另用 `commitment_conflict`（409，区域变更抹掉未结束承诺窗口内的
 全部安全出发时刻）与 `not_found`（404，未知承诺 ID）；
+承诺兑现另用 `commitment_already_redeemed`（409，已兑现，details 带
+`pass_id`）、`commitment_cancelled`（409，普通取消）、
+`commitment_expired`（409，窗口已结束），出发时刻越窗或不晚于受理时刻为
+`invalid_input`（422）、不在当前安全出发区间内为 `unsafe_trajectory`（422）；
 安全状态观察另用 `not_found`（404，未知观察编号；观察登记复用
 `invalid_trajectory`）；
 最小区域豁免预演另用 `duplicate_region`（422，候选编号重复）、
@@ -1135,6 +1252,10 @@ bash examples/curl_passes.sh
 # 择时通行承诺（签发/查询当前区间/取消；含 409 commitment_conflict 约束、
 # 幂等取消、无安全时刻与窗口起点已过拒签）
 bash examples/curl_commitments.sh
+
+# 承诺兑现（选定安全出发时刻把承诺兑现为一张固定时刻凭证；含 201 成功、
+# 409 已兑现（带 pass_id）/普通取消/窗口结束、422 越窗/不安全/不带时区、404）
+bash examples/curl_commitment_redeem.sh
 
 # 安全状态观察（登记/查询/取消；安全与不安全均可登记；区域变更后的
 # 结论翻转事件、事件游标分页、取消幂等与错误契约）
@@ -1189,6 +1310,12 @@ DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_
 # 「变更前有、变更后没有」语义、窗口结束放行、左闭右开端点、
 # 签发与区域写入并发串行化，会清空 regions/commitments 表）
 DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_commitments_api.py
+
+# 承诺兑现 API 集成测试（安全兑现出唯一凭证、原承诺按取消语义失效、
+# 按当前区域集合重验、越窗/不晚于受理/不安全拒绝、已兑现与普通取消可区分、
+# 窗口结束拒绝、新凭证承担 pass_conflict、并发兑现至多一次成功，
+# 会清空 regions/commitments/passes 等业务表）
+DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_commitment_redeem_api.py
 
 # 幂等键 API 集成测试（同键重试回放原响应、并发同键只提交一次、
 # 同键不同内容 409、非法键 422、失败不占键，会清空 regions/passes/idempotency_keys 表）

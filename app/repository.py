@@ -99,6 +99,43 @@ class CommitmentConflict(Exception):
         self.commitment_ids = commitment_ids
 
 
+class CommitmentAlreadyRedeemed(Exception):
+    """承诺已被兑现为固定时刻凭证；携带已生成的凭证 id（与普通取消区分）。"""
+
+    def __init__(self, commitment_id: int, pass_id: int):
+        super().__init__(f"承诺 {commitment_id} 已兑现为凭证 {pass_id}，不能重复兑现")
+        self.commitment_id = commitment_id
+        self.pass_id = pass_id
+
+
+class CommitmentCancelled(Exception):
+    """承诺已被普通取消（未兑现），不能兑现。"""
+
+    def __init__(self, commitment_id: int):
+        super().__init__(f"承诺 {commitment_id} 已取消，不能兑现")
+        self.commitment_id = commitment_id
+
+
+class CommitmentExpired(Exception):
+    """承诺候选窗口已结束（window_end 不晚于受理时刻），不能兑现。"""
+
+    def __init__(self, commitment_id: int):
+        super().__init__(f"承诺 {commitment_id} 的候选出发窗口已结束，不能兑现")
+        self.commitment_id = commitment_id
+
+
+class CommitmentRedeemInvalid(Exception):
+    """兑现出发时刻非法：不晚于受理时刻或越出原候选窗口（左闭右开）。"""
+
+
+class CommitmentRedeemUnsafe(Exception):
+    """兑现出发时刻不在按当前区域集合重算的安全出发区间内；携带穿越明细。"""
+
+    def __init__(self, results: list[dict]):
+        super().__init__("出发时刻在当前区域集合下生成的轨迹不安全，凭证未签发")
+        self.results = results
+
+
 class IdempotencyKeyConflict(Exception):
     """同一幂等键被内容不同的请求复用（操作类型/目标区域/请求内容不一致）。"""
 
@@ -1203,7 +1240,7 @@ def get_commitment(cur, commitment_id: int) -> dict | None:
     cur.execute(
         """
         SELECT id, trajectory, window_start, window_end, status,
-               issued_revision, created_at, cancelled_at
+               issued_revision, created_at, cancelled_at, redeemed_pass_id
         FROM commitments WHERE id = %s
         """,
         (commitment_id,),
@@ -1220,7 +1257,7 @@ def cancel_commitment(cur, commitment_id: int) -> dict | None:
     cur.execute(
         """
         SELECT id, trajectory, window_start, window_end, status,
-               issued_revision, created_at, cancelled_at
+               issued_revision, created_at, cancelled_at, redeemed_pass_id
         FROM commitments WHERE id = %s
         FOR UPDATE
         """,
@@ -1235,12 +1272,137 @@ def cancel_commitment(cur, commitment_id: int) -> dict | None:
             UPDATE commitments SET status = 'cancelled', cancelled_at = now()
             WHERE id = %s
             RETURNING id, trajectory, window_start, window_end, status,
-                      issued_revision, created_at, cancelled_at
+                      issued_revision, created_at, cancelled_at, redeemed_pass_id
             """,
             (commitment_id,),
         )
         row = cur.fetchone()
     return row
+
+
+def _departure_in_intervals(departure_epoch: float, intervals: list[dict]) -> bool:
+    """出发时刻是否落在任一左闭右开安全出发区间内（含 EPS 容差，与区间引擎一致）。"""
+    from .geometry import EPS
+
+    for iv in intervals:
+        left_ok = departure_epoch >= iv["start"] - EPS if iv["start_inclusive"] \
+            else departure_epoch > iv["start"] + EPS
+        right_ok = departure_epoch < iv["end"] - EPS if not iv["end_inclusive"] \
+            else departure_epoch <= iv["end"] + EPS
+        if left_ok and right_ok:
+            return True
+    return False
+
+
+def redeem_commitment(cur, commitment_id: int, departure: datetime) -> dict:
+    """把一张未取消、窗口未结束的承诺兑现为一张固定时刻通行凭证。
+
+    在持有全局元数据行锁的单个写事务内完成，与区域变更、承诺签发/取消、
+    凭证签发共用同一把锁，全程串行化：
+      1. 锁 meta 行后取受理时刻 now，按 id 锁定承诺行（FOR UPDATE）；
+      2. 状态校验：未知返回 None；已兑现抛 CommitmentAlreadyRedeemed（带
+         pass_id）；普通取消抛 CommitmentCancelled；窗口已结束
+         （window_end <= now）抛 CommitmentExpired；
+      3. 出发时刻必须严格晚于 now，且落在原候选窗口 [window_start,
+         window_end) 内，否则 CommitmentRedeemInvalid；
+      4. 按当前完整区域集合重算安全出发区间，展开绝对时刻轨迹并直接核验：
+         不安全抛 CommitmentRedeemUnsafe（带穿越明细），不生成凭证；
+      5. 安全：先插入唯一一张凭证（issued_revision 为当前 revision，
+         兑现不推进 revision），再把承诺按既有取消语义置为 cancelled
+         （cancelled_at=now()）并回填 redeemed_pass_id。
+    返回 {"commitment": 兑现后承诺行, "pass": 新凭证行, "revision": 当前 revision}。
+    """
+    # 锁全局元数据行：与区域变更、签发/取消、凭证签发串行化，
+    # 重验安全性与落库之间无人插队
+    revision = get_revision(cur)
+    now = utcnow()
+    cur.execute(
+        """
+        SELECT id, trajectory, window_start, window_end, status,
+               issued_revision, created_at, cancelled_at, redeemed_pass_id
+        FROM commitments WHERE id = %s
+        FOR UPDATE
+        """,
+        (commitment_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    if row["status"] == "cancelled":
+        # 已兑现与普通取消走不同错误，失败方可据此区分
+        if row["redeemed_pass_id"] is not None:
+            raise CommitmentAlreadyRedeemed(commitment_id, int(row["redeemed_pass_id"]))
+        raise CommitmentCancelled(commitment_id)
+    if row["window_end"] <= now:
+        raise CommitmentExpired(commitment_id)
+
+    departure = departure.astimezone(timezone.utc)
+    dep_epoch = departure.timestamp()
+    if dep_epoch <= now.timestamp():
+        raise CommitmentRedeemInvalid(
+            "出发时刻必须晚于服务端受理时刻（当前服务时间）"
+        )
+    if not (row["window_start"].timestamp() <= dep_epoch < row["window_end"].timestamp()):
+        raise CommitmentRedeemInvalid(
+            "出发时刻必须落在承诺原候选出发窗口 [window_start, window_end) 内"
+        )
+
+    relative = [
+        (float(p["t"]), float(p["x"]), float(p["y"]))
+        for p in row["trajectory"]
+    ]
+    regions = [
+        _region_row_to_geom(r) for r in _load_all_regions_locked(cur).values()
+    ]
+    # 按当前区域集合重算安全出发区间（与 GET /api/commitments 的当前视角一致）
+    intervals = geometry.safe_departure_intervals(
+        relative, regions,
+        row["window_start"].timestamp(), row["window_end"].timestamp(),
+    )
+    # 展开按承诺相对轨迹生成的绝对时刻轨迹；区间判定与逐点核验共用同一
+    # 禁止出发公式 [vf-b, vt-a)，区间内时刻必然对应一条安全轨迹
+    abs_traj = [(dep_epoch + t, x, y) for t, x, y in relative]
+    if not _departure_in_intervals(dep_epoch, intervals):
+        # 不安全：以展开后的绝对时刻轨迹直接核验，给出精确穿越明细
+        results = geometry.verify_trajectory(abs_traj, regions)
+        raise CommitmentRedeemUnsafe(results)
+
+    # 安全：先生成唯一一张凭证，再按既有取消语义失效原承诺（同一事务）
+    cur.execute(
+        """
+        INSERT INTO passes (trajectory, start_time, end_time, status, issued_revision)
+        VALUES (%(trajectory)s::jsonb, %(start)s, %(end)s, 'active', %(revision)s)
+        RETURNING id, trajectory, status, issued_revision, created_at, cancelled_at
+        """,
+        {
+            "trajectory": json.dumps(
+                [{"x": x, "y": y, "t": t} for t, x, y in abs_traj]
+            ),
+            "start": datetime.fromtimestamp(abs_traj[0][0], tz=timezone.utc),
+            "end": datetime.fromtimestamp(abs_traj[-1][0], tz=timezone.utc),
+            "revision": revision,
+        },
+    )
+    pass_row = cur.fetchone()
+    cur.execute(
+        """
+        UPDATE commitments
+        SET status = 'cancelled', cancelled_at = now(), redeemed_pass_id = %(pass_id)s
+        WHERE id = %(id)s AND status = 'active'
+        RETURNING id, trajectory, window_start, window_end, status,
+                  issued_revision, created_at, cancelled_at, redeemed_pass_id
+        """,
+        {"id": commitment_id, "pass_id": pass_row["id"]},
+    )
+    updated = cur.fetchone()
+    if updated is None:
+        # 并发竞态兜底：本事务持有行锁后理论上不可达；交由调用方整体回滚
+        raise CommitmentAlreadyRedeemed(commitment_id, int(pass_row["id"]))
+    return {
+        "commitment": updated,
+        "pass": pass_row,
+        "revision": revision,
+    }
 
 
 # ---------------------------------------------------------------- 安全状态观察

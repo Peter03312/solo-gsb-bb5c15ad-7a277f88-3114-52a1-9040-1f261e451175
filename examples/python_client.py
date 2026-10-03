@@ -231,6 +231,42 @@ def main() -> None:
     call("DELETE", f"/api/regions/{commit_region['region']['id']}")
     call("DELETE", f"/api/regions/{unblocked['region']['id']}")
 
+    # ---- 承诺兑现：选定安全出发时刻 → 一张固定时刻通行凭证 ----
+    # 另签一张高位轨迹承诺（y=200，不接触上述 SQUARE 区域），窗口全程安全
+    redeem_win_start = datetime.now(timezone.utc) + timedelta(seconds=900)
+    redeem_win_end = redeem_win_start + timedelta(seconds=600)
+    redeem_commit = call("POST", "/api/commitments", {
+        "points": [
+            {"x": -50, "y": 200, "t": 0},
+            {"x": 150, "y": 200, "t": 60},
+        ],
+        "window_start": redeem_win_start.isoformat(),
+        "window_end": redeem_win_end.isoformat(),
+    })
+    redeem_commit_id = redeem_commit["id"]
+    # 出发时刻取窗口起点 +30s（晚于受理时刻、在窗口内、当前集合下安全）
+    departure = redeem_win_start + timedelta(seconds=30)
+    redeemed = call("POST", f"/api/commitments/{redeem_commit_id}/redeem",
+                    {"departure_time": departure.isoformat()})
+    show("兑现承诺为固定时刻凭证（只生成一张，区域 revision 不变）", redeemed)
+    new_pass_id = redeemed["pass"]["id"]
+    # 绝对时刻轨迹由承诺相对轨迹按出发时刻展开
+    print("  凭证首点时刻：", redeemed["pass"]["trajectory"][0]["t"])
+    # 原承诺按既有取消语义呈现：查询为 cancelled、intervals 为空
+    show("兑现后查询原承诺（cancelled 语义）",
+         call("GET", f"/api/commitments/{redeem_commit_id}"))
+    show("查询新凭证", call("GET", f"/api/passes/{new_pass_id}"))
+    # 重复兑现 → 409 commitment_already_redeemed，details 带原 pass_id
+    try:
+        call("POST", f"/api/commitments/{redeem_commit_id}/redeem",
+             {"departure_time": departure.isoformat()})
+    except urllib.error.HTTPError as exc:
+        err = json.loads(exc.read().decode())
+        show("重复兑现被拒：409 commitment_already_redeemed", err)
+        print("  已生成凭证 id：", err["error"]["details"][0]["pass_id"])
+    # 清理：取消新凭证（承诺无需再取消，已是 cancelled）
+    call("POST", f"/api/passes/{new_pass_id}/cancel")
+
     # ---- 安全状态观察：登记 / 查询 / 取消 + 结论翻转事件分页 ----
     wide = {"valid_from": "2020-01-01T00:00:00Z", "valid_to": "2030-01-01T00:00:00Z"}
     # 观察 1：从区域上方 y=200 经过；此刻演示区域均已清理，结论 safe

@@ -84,6 +84,13 @@ CREATE TABLE IF NOT EXISTS commitments (
     issued_revision BIGINT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     cancelled_at    TIMESTAMPTZ,
+    -- 兑现为固定时刻凭证后回填所生成凭证的 id；普通取消保持 NULL。
+    -- 状态沿用 cancelled（既有查询/取消/区域保护语义不变），凭此列把
+    -- 「已兑现」与「普通取消」区分开；一张承诺至多兑现一次（见兑现事务）。
+    -- 该 id 由兑现事务与凭证行同写同提交、且凭证只取消不删除，关联完整性
+    -- 由应用层保证（不在数据库层加外键，以免与单表 TRUNCATE 的既有清理
+    -- 方式相互阻塞）
+    redeemed_pass_id BIGINT,
     CONSTRAINT commitments_status_check CHECK (status IN ('active', 'cancelled')),
     CONSTRAINT commitments_window_order CHECK (window_start < window_end)
 );
@@ -170,6 +177,12 @@ CREATE TABLE IF NOT EXISTS region_change_audit (
     CONSTRAINT region_change_audit_type_check
         CHECK (change_type IN ('create', 'update', 'delete', 'batch'))
 );
+
+-- 既有库的幂等迁移：承诺兑现功能新增列（全新库已在建表语句中包含）。
+-- 与建表语句一致使用普通 BIGINT（不在数据库层加外键，以免与既有
+-- 单表 TRUNCATE 清理方式相互阻塞）；关联完整性由应用层保证。
+ALTER TABLE commitments
+    ADD COLUMN IF NOT EXISTS redeemed_pass_id BIGINT;
 """
 
 
